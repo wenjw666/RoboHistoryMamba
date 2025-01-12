@@ -8,7 +8,7 @@ rvt/data/val/
 rvt/data/test/
 rvt/replay/
 rvt/libs/
-# rvt/mamba/
+rvt/mamba/build/
 # rvt/causal-conv1d/
 coppelia_install_dir/
 # rvt/runs/
