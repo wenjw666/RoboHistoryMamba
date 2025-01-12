@@ -1,0 +1,8 @@
+device: '0'
+exp_cfg_opts: ''
+exp_cfg_path: ''
+log_dir: runs
+mvt_cfg_opts: ''
+mvt_cfg_path: ''
+refresh_replay: false
+with_eval: false

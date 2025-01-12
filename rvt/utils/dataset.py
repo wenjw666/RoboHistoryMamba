@@ -480,9 +480,6 @@ def _add_keypoints_to_replay(
             "front_keyframe_point_cloud": obs_dict_tp1["front_point_cloud"],
         }
 
-
-        import pdb
-        pdb.set_trace()
         others.update(final_obs)
         others.update(obs_dict)  # 采样帧观测
         others.update(keyframe_camera_info)  # 关键帧相机参数

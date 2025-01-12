@@ -26,19 +26,66 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 from rvt.diffuser_actor.utils.layers import ParallelAttention, FFWRelativeCrossAttentionModule
-from rvt.diffuser_actor.utils.position_encodings import SinusoidalPosEmb
+from rvt.diffuser_actor.utils.position_encodings import SinusoidalPosEmb, RotaryPositionEncoding, \
+    RotaryPositionEncoding3D
 from rvt.diffuser_actor.utils.Hilbert3d import Hilbert3d
-from rvt.diffuser_actor.utils.mambablock import MambaLayerglobal, MambaLayerlocal
+from rvt.diffuser_actor.utils.mambablock import MambaLayerglobal, MambaLayerlocal, MambaTotalBlock
 import rvt.mvt.utils as mvt_utils
 import matplotlib.pyplot as plt
 import numpy as np
-
+from io import BytesIO
+from PIL import Image
+import cv2
 MODEL_PATH = 'your_model_path'
 _MODELS = {
     "videomamba_t16_in1k": os.path.join(MODEL_PATH, "videomamba_t16_in1k_res224.pth"),
     "videomamba_s16_in1k": os.path.join(MODEL_PATH, "videomamba_s16_in1k_res224.pth"),
     "videomamba_m16_in1k": os.path.join(MODEL_PATH, "videomamba_m16_in1k_res224.pth"),
 }
+
+
+class CustomDETRHead(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super(CustomDETRHead, self).__init__()
+
+        # 3D point 的预测头，输出 3 个值 (x, y, z)
+        self.bbox_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+            # nn.Sigmoid()  # 将边界框归一化到 [0, 1]
+        )
+
+        # 四个像素坐标的预测头，每个坐标使用一个线性层，将 hidden_dim 转换成 2 个值 (x, y)
+        # 使用 sigmoid 激活使像素坐标归一化到 [0, 1] 范围
+        self.pixel_coord_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 2),
+                nn.Sigmoid()  # 将坐标归一化到 [0, 1]
+            ) for _ in range(4)
+        ])
+
+    def forward(self, fusion_output):
+        """
+        输入:
+        - fusion_output: [batch_size, 5, hidden_dim] 的特征张量
+
+        输出:
+        - bbox_preds: [batch_size, 6]，3D 边界框预测结果
+        - pixel_coords_preds: [batch_size, 4, 2]，四个像素坐标的预测结果
+        """
+
+        # 选择第一个位置的特征，用于 3D 边界框预测
+        bbox_preds = self.bbox_layer(fusion_output[:, 0, :])  # [batch_size, 6]
+
+        # 选择后四个位置的特征，用于四个像素坐标预测
+        pixel_coords_preds = torch.stack([
+            layer(fusion_output[:, i, :]) for i, layer in enumerate(self.pixel_coord_layers, start=1)
+        ], dim=1)  # [batch_size, 4, 2]
+
+        return bbox_preds, pixel_coords_preds
 
 
 class HeatmapPredictor(nn.Module):
@@ -85,10 +132,11 @@ class HeatmapPredictor(nn.Module):
 
 
 class MyMambaPipeline(nn.Module):
-    def __init__(self, num_features=192, num_frames=4, num_camera=4, img_height=128, img_width=128, patch_size=16):
+    def __init__(self, num_features=192, num_frames=4, num_camera=4, img_height=128, img_width=128, patch_size=16,
+                 depth_of_rgb_mamba=24, depth_of_pcd_mamba=24, depth_rgb=4, depth_pcd=4, depth_fusionatten=4, depth_crossatten=4, fusion_layer_num=4):
         super().__init__()
         self.model_feature_dim = num_features
-        self.num_frames = num_frames
+        self.num_his_frames = num_frames
         self.num_camera = num_camera
         self.img_height = img_height
         self.img_width = img_width
@@ -96,52 +144,84 @@ class MyMambaPipeline(nn.Module):
         assert (self.img_height == self.img_width), "w should equal to h"
         self.num_patch = self.img_height // patch_size
         self.RGB_mamba_block = VisionMamba(
-            patch_size=16,
-            embed_dim=192,
-            depth=24,
+            patch_size=patch_size,
+            embed_dim=num_features,
+            depth=depth_of_rgb_mamba,
             rms_norm=True,
             residual_in_fp32=True,
             fused_add_norm=True,
-            num_frames=16).cuda()
+            num_frames=num_frames*num_camera).cuda()
 
         self.pcd_mamba_block = VisionMamba(
-            patch_size=16,
-            embed_dim=192,
-            depth=24,
+            patch_size=patch_size,
+            embed_dim=num_features,
+            depth=depth_of_pcd_mamba,
             rms_norm=True,
             residual_in_fp32=True,
             fused_add_norm=True,
-            num_frames=16).cuda()
+            num_frames=num_frames * num_camera).cuda()
 
-        self.conv1d_on_camera_dim = nn.Conv1d(in_channels=self.num_camera*2, out_channels=1, kernel_size=1).cuda()
+        #######################
+        self.h_l = torch.tensor(self.hilbert_curve_large_scale()["hilbert_curve_large_scale"]).to("cuda")  # [256]
+        self.mamba_blocks_rgb = nn.ModuleList(
+            [MambaTotalBlock(dim=num_features, total_layers_num=depth_rgb) for _ in range(self.num_camera)]
+        )
+        self.mamba_blocks_pcd = nn.ModuleList(
+            [MambaTotalBlock(dim=num_features, total_layers_num=depth_pcd) for _ in range(self.num_camera)]
+        )
+        self.rgb_cross_atten2each_came = nn.ModuleList(
+            [FFWRelativeCrossAttentionModule(num_features, 8, depth_crossatten) for _ in range(self.num_camera)]
+        )
+        self.pcd_cross_atten2each_came = nn.ModuleList(
+            [FFWRelativeCrossAttentionModule(num_features, 8, depth_crossatten) for _ in range(self.num_camera)]
+        )
 
-        self.fusion_attention = ParallelAttention(
-            num_layers=1,
-            d_model=192, n_heads=8,
-            self_attention1=True, self_attention2=True,
-            cross_attention1=True, cross_attention2=True,
-            rotary_pe=False, apply_ffn=False
-        ).cuda()  # todo 可选是否用旋转编码
+        self.fusion_layer_num = fusion_layer_num
+        self.fusion_cross_atten = nn.ModuleList(
+            [FFWRelativeCrossAttentionModule(num_features, 8, depth_fusionatten) for _ in range(self.fusion_layer_num * 2)]
+        )
 
-        self.lang_cross_atten = FFWRelativeCrossAttentionModule(192, 8, 2).cuda()
+        self.pre_head = CustomDETRHead(num_features).cuda()
 
-        self.linear1 = nn.Linear(512, 192).cuda()
-        # 64 * 64 * 128
-        self.GlobalMambaBlock1 = MambaLayerglobal(dim=num_features)
-        self.LocalMambaBlock1 = MambaLayerlocal(dim=num_features)
-        self.GlobalMambaBlock2 = MambaLayerglobal(dim=num_features)
-        self.LocalMambaBlock2 = MambaLayerlocal(dim=num_features)
+        self.learnable_query = nn.Parameter(torch.randn(1, 1, self.model_feature_dim))
 
-        self.conv_down_sample = nn.Conv3d(192, 192 * 2, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)).cuda()
+        self.abs_emb = SinusoidalPosEmb(self.model_feature_dim)
+        self.rot_emb_3D = RotaryPositionEncoding3D(self.model_feature_dim)
+        self.rot_emb_2D = RotaryPositionEncoding(self.model_feature_dim)
 
-        self.GlobalMambaBlockLowRes1 = MambaLayerglobal(dim=num_features * 2)
-        self.LocalMambaBlockLowRes1 = MambaLayerlocal(dim=num_features * 2)
-        self.GlobalMambaBlockLowRes2 = MambaLayerglobal(dim=num_features * 2)
-        self.LocalMambaBlockLowRes2 = MambaLayerlocal(dim=num_features * 2)
+        #######################
+        # self.conv1d_on_camera_dim = nn.Conv1d(in_channels=self.num_camera * 2, out_channels=1, kernel_size=1).cuda()
+        #
+        # self.fusion_attention = ParallelAttention(
+        #     num_layers=1,
+        #     d_model=192, n_heads=8,
+        #     self_attention1=True, self_attention2=True,
+        #     cross_attention1=True, cross_attention2=True,
+        #     rotary_pe=False, apply_ffn=False
+        # ).cuda()  # todo 可选是否用旋转编码
+        #
+        # self.lang_cross_atten = FFWRelativeCrossAttentionModule(192, 8, 2).cuda()
+        #
+        # self.linear1 = nn.Linear(512, 192).cuda()
+        # # 64 * 64 * 128
+        # self.GlobalMambaBlock1 = MambaLayerglobal(dim=num_features)
+        # self.LocalMambaBlock1 = MambaLayerlocal(dim=num_features)
+        # self.GlobalMambaBlock2 = MambaLayerglobal(dim=num_features)
+        # self.LocalMambaBlock2 = MambaLayerlocal(dim=num_features)
+        #
+        # self.conv_down_sample = nn.Conv3d(192, 192 * 2, kernel_size=(3, 3, 3), stride=(1, 2, 2),
+        #                                   padding=(1, 1, 1)).cuda()
+        #
+        # self.GlobalMambaBlockLowRes1 = MambaLayerglobal(dim=num_features * 2)
+        # self.LocalMambaBlockLowRes1 = MambaLayerlocal(dim=num_features * 2)
+        # self.GlobalMambaBlockLowRes2 = MambaLayerglobal(dim=num_features * 2)
+        # self.LocalMambaBlockLowRes2 = MambaLayerlocal(dim=num_features * 2)
+        #
+        # self.conv_down_sample2 = nn.Conv3d(192 * 2, 192, kernel_size=(4, 3, 3), stride=(4, 1, 1),
+        #                                    padding=(0, 1, 1)).cuda()
+        # self.head = HeatmapPredictor().cuda()
 
-        self.conv_down_sample2 = nn.Conv3d(192 * 2, 192, kernel_size=(4, 3, 3), stride=(4, 1, 1), padding=(0, 1, 1)).cuda()
-        self.head = HeatmapPredictor().cuda()
-
+        self.proprio_dim = 4
     def forward(
             self, input
     ):
@@ -150,75 +230,251 @@ class MyMambaPipeline(nn.Module):
         vis_pc_feat: [bs, channel, nframe*ncam, H, W]
         lang_goal_embs:[bs, 77, 512]
         """
+
+        torch.autograd.set_detect_anomaly(True)
+
         vis_img_feat, vis_pc_feat, lang_goal_embs = input
         bs = vis_img_feat.shape[0]
-        import pdb
-        pdb.set_trace()
+
+        pc_feat = self.scale_point_cloud_features(vis_pc_feat.transpose(1, 2).flatten(start_dim=0, end_dim=1))
+        pc_rel_pe = self.rot_emb_3D(pc_feat.flatten(start_dim=1, end_dim=3)).view(bs, self.num_his_frames,
+                                                                                  self.num_camera, self.num_patch,
+                                                                                  self.num_patch,
+                                                                                  self.model_feature_dim, 2)
+        abs_pe = self.abs_emb(
+            torch.arange(0, self.num_his_frames * self.num_camera * self.num_patch * self.num_patch,
+                         device=vis_img_feat.device)
+        )[None].repeat(bs, 1, 1).view(bs, self.num_his_frames,
+                                      self.num_camera, self.num_patch,
+                                      self.num_patch,
+                                      self.model_feature_dim)
+
         rgb_mamba_out = self.RGB_mamba_block(vis_img_feat)  #
 
         pcd_mamba_out = self.pcd_mamba_block(
             vis_pc_feat)  # [bs, ch, 4*his, 128, 128] -> [bs, dim, n_hisframe*n_cam, height/patch_size, height/patch_size] -> [bs, seq_len, dim]  seq_len = n_cam * n_hisframe * height/patch_size * height/patch_size
 
-        emb = SinusoidalPosEmb(self.model_feature_dim)
-        pos_emb = emb(torch.arange(0, pcd_mamba_out.size(1), device=pcd_mamba_out.device))[None].repeat(
-            len(pcd_mamba_out), 1, 1)  # [bs, seq_len, feature_dim]
+        # pos_emb = self.abs_emb(torch.arange(0, pcd_mamba_out.size(1), device=pcd_mamba_out.device))[None].repeat(
+        #     len(pcd_mamba_out), 1, 1)  # [bs, seq_len, feature_dim]
 
-        seq1, seq2 = self.fusion_attention(
-            seq1=rgb_mamba_out, seq1_key_padding_mask=None,
-            seq2=pcd_mamba_out, seq2_key_padding_mask=None,
-            seq1_pos=None, seq2_pos=None,
-            seq1_sem_pos=pos_emb, seq2_sem_pos=pos_emb
-        )  # [4, 256, 192]
+        # rel_pcd_pe = self.rot_emb_3D(vis_pc_feat.flatten(start_dim=2).transpose(1, 2)[:,:100,:])
+        # rel_pcd_pe = self.rot_emb_2D(rgb_mamba_out[:, :96, 1])  # torch.Size([4, 96, 2, 2])
+        # rel_rgb_pe = self.rot_emb_2D(vis_img_feat)
 
-        x = torch.cat((seq1.view(bs, self.num_frames, self.num_camera, self.num_patch, self.num_patch, self.model_feature_dim),
-                       seq2.view(bs, self.num_frames, self.num_camera, self.num_patch, self.num_patch, self.model_feature_dim)),
-                      dim=2)  # torch.Size([bs, num_his, pcd_cam+img_cam , num_patch, num_patch, dim])
-
-        # 一维卷积
-
-        x = x.permute(0, 2, 1, 3, 4, 5).flatten(start_dim=2)  # [4, 8, 4, 8, 8, 192]
-        x = self.conv1d_on_camera_dim(x)
-        x = x.view(bs, 1, 4, 8, 8, 192).squeeze(1).permute(0, 1, 4, 2, 3)  # ->[bs, num_his, dim, num_patch, num_patch]
-
-        # lang_goal_embs
-        x = x.permute(2, 0, 1, 3, 4).flatten(start_dim=2).transpose(0, 2)  # [dim, bs, num_his, num_patch, num_patch]->[dim, bs, num_his*num_patch*num_patch]-> [L, bs, dim]
-        lang_goal_embs = self.linear1(lang_goal_embs)  # [bs, 77, 512]->[bs, 77, 192]
-        x = self.lang_cross_atten(query=x, value=lang_goal_embs.transpose(0, 1))[-1]  # ->[seq_len, bs, dim]
-        x = x.transpose(0, 1).view(bs, 4, 8, 8, 192).permute(0, 1, 4, 2, 3)  # [seq_len, bs, dim] -> [bs, nframe, dim, npatch, npatch]
-
-        # global + local mamba
-
-        h_l = torch.tensor(self.hilbert_curve_large_scale()["hilbert_curve_large_scale"]).to("cuda")  # [256]
-        h_s = torch.tensor(self.hilbert_curve_small_scale()["hilbert_curve_small_scale"]).to("cuda")  # [64]
-
-        M1 = self.GlobalMambaBlock1(x)  # ->[bs, nframe, dim, num_patch, num_patch]
-        M1 = self.LocalMambaBlock1(M1, h_l)
-        M1 = self.GlobalMambaBlock2(M1)
-        M1 = self.LocalMambaBlock2(M1, h_l)  # ->[bs, nframe, dim, num_patch, num_patch]
-
-        x_down = rearrange(M1, 'n d c h w ->  n c d h w')
-        x_down = torch.nn.functional.relu(self.conv_down_sample (x_down))
-        x_down = rearrange(x_down, 'n c d h w ->  n d c h w')  # ->[bs, nframe, dim*2, num_patch/2, num_patch/2]
-
-        M2 = self.GlobalMambaBlockLowRes1(x_down)
-        M2 = self.LocalMambaBlockLowRes1(M2, h_s)
-        M2 = self.GlobalMambaBlockLowRes2(M2)
-        M2 = self.LocalMambaBlockLowRes2(M2, h_s)
+        # seq1, seq2 = self.fusion_attention(
+        #     seq1=rgb_mamba_out, seq1_key_padding_mask=None,
+        #     seq2=pcd_mamba_out, seq2_key_padding_mask=None,
+        #     seq1_pos=None, seq2_pos=None,
+        #     seq1_sem_pos=pos_emb, seq2_sem_pos=pos_emb
+        # )  # [4, 256, 192]
+        #
+        # x = torch.cat((seq1.view(bs, self.num_frames, self.num_camera, self.num_patch, self.num_patch, self.model_feature_dim),
+        #                seq2.view(bs, self.num_frames, self.num_camera, self.num_patch, self.num_patch, self.model_feature_dim)),
+        #               dim=2)  # torch.Size([bs, num_his, pcd_cam+img_cam , num_patch, num_patch, dim])
 
 
-        x_re = rearrange(M2, 'n d c h w ->  n c d h w')
-        x_re = self.conv_down_sample2(x_re).squeeze(2)
-        x_re = rearrange(x_re, 'n c h w ->  n h w c')  # ->[bs, num_patch/2, num_patch/2, dim]
+        # RGB branch
+        RGB_cam_features = []
+        latest_rbg_frame = torch.zeros(bs, self.model_feature_dim, self.num_patch, self.num_patch).to("cuda")
+        rgb_feat_1 = rgb_mamba_out.view(bs, self.num_his_frames, self.num_camera, self.num_patch, self.num_patch,
+                                        self.model_feature_dim).permute(0, 1, 2, 5, 3, 4)  # B, nf, nc, C, H, W
+        for cam_idx in range(self.num_camera):
+            cam_feature = self.mamba_blocks_rgb[cam_idx](
+                rgb_feat_1[:, :, cam_idx, :, :, :], self.h_l)  # input x: B, nf, C, H, W output: x: B, nf, C, H, W
 
-        hm = self.head(x_re)  # ->[bs,ncamera, H, W]
-        return hm
+            cam_feature += abs_pe[:, :, cam_idx].permute(0, 1, 4, 2, 3)
+
+            latest_rbg_frame += cam_feature[:, -1]  # [B, D, H, W] todo
+
+            rgb_cross_atten_output = \
+                self.rgb_cross_atten2each_came[cam_idx](query=latest_rbg_frame.flatten(start_dim=2).permute(2, 0, 1),
+                                                        value=cam_feature.permute(2, 0, 1, 3, 4).flatten(
+                                                            start_dim=2).transpose(0, 2),
+                                                        query_pos=pc_rel_pe[:, -1, cam_idx].flatten(start_dim=1,
+                                                                                                    end_dim=2),
+                                                        value_pos=pc_rel_pe[:, :, cam_idx].flatten(start_dim=1,
+                                                                                                   end_dim=3)) \
+                    [-1].view(self.num_patch, self.num_patch, bs, self.model_feature_dim).permute(2, 3, 0, 1)
+
+            latest_rbg_frame += rgb_cross_atten_output  # [B, D, H, W] todo
+            RGB_cam_features.append(rgb_cross_atten_output.flatten(start_dim=2).transpose(1, 2))  # [[B, L, D]]
+
+        RGB_cam_features_for_fusion = torch.concat(RGB_cam_features, dim=1)  # [b, ncam*l ,d]
+
+        # pcd branch
+        pcd_cam_features = []
+        latest_pcd_frame = torch.zeros(bs, self.model_feature_dim, self.num_patch, self.num_patch).to("cuda")
+        pcd_feat_1 = pcd_mamba_out.view(bs, self.num_his_frames, self.num_camera, self.num_patch, self.num_patch,
+                                        self.model_feature_dim).permute(0, 1, 2, 5, 3, 4)  # B, nf, nc, C, H, W
+        for cam_idx in range(self.num_camera):
+            cam_feature = self.mamba_blocks_pcd[cam_idx](
+                pcd_feat_1[:, :, cam_idx, :, :, :], self.h_l)
+
+            cam_feature += abs_pe[:, :, cam_idx].permute(0, 1, 4, 2, 3)
+            latest_pcd_frame += cam_feature[:, -1]  #
+
+            pcd_cross_atten_output = \
+                self.pcd_cross_atten2each_came[cam_idx](query=latest_pcd_frame.flatten(start_dim=2).permute(2, 0, 1),
+                                                        value=cam_feature.permute(2, 0, 1, 3, 4).flatten(
+                                                            start_dim=2).transpose(0, 2),
+                                                        query_pos=pc_rel_pe[:, -1, cam_idx].flatten(start_dim=1,
+                                                                                                    end_dim=2),
+                                                        value_pos=pc_rel_pe[:, :, cam_idx].flatten(start_dim=1,
+                                                                                                   end_dim=3)) \
+                    [-1].view(self.num_patch, self.num_patch, bs, self.model_feature_dim).permute(2, 3, 0, 1)
+            latest_pcd_frame += pcd_cross_atten_output  # [B, D, H, W] todo
+            pcd_cam_features.append(pcd_cross_atten_output.flatten(start_dim=2).transpose(1, 2))  # [[B, L, D]]
+        pcd_cam_features_for_fusion = torch.concat(pcd_cam_features, dim=1)  # [b, ncam*l ,d]
+
+        # fusion part
+        fusion_query = self.learnable_query.repeat(bs, 5, 1)  # [b, 5, d]
+        mask = torch.zeros(bs, fusion_query.shape[1], RGB_cam_features_for_fusion.shape[
+            1])  # attn_mask: :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
+        pre_3D_bbox_list = []
+        pre_points_list = []
+        for idx in range(self.fusion_layer_num):
+            fusion_output = self.fusion_cross_atten[idx](query=fusion_query.transpose(0, 1),
+                                                         value=RGB_cam_features_for_fusion.transpose(0, 1),attn_mask=mask)[
+                -1].transpose(0, 1)
+
+            pre_3D_bbox, pre_pixel_points = self.pre_head(fusion_output)  # pre_res:[bs, list[6个数 3dbbox,4个像素点]]
+            mask = self.generate_mask(pre_pixel_points, mask.shape[1:])
+            pre_3D_bbox_list.append(pre_3D_bbox)
+            pre_pixel_points = pre_pixel_points*self.img_height
+            pre_points_list.append(pre_pixel_points)
+
+            fusion_output = self.fusion_cross_atten[idx + 1](query=fusion_query.transpose(0, 1),
+                                                             value=pcd_cam_features_for_fusion.transpose(0, 1),attn_mask=mask)[
+                -1].transpose(0, 1)
+
+            pre_3D_bbox, pre_pixel_points = self.pre_head(fusion_output)
+            mask = self.generate_mask(pre_pixel_points, mask.shape[1:])
+            pre_3D_bbox_list.append(pre_3D_bbox)
+            pre_pixel_points = pre_pixel_points * self.img_height
+            pre_points_list.append(pre_pixel_points)
+
+        return  [pre_3D_bbox_list[-2], pre_3D_bbox_list[-1]], [pre_points_list[-2], pre_points_list[-1]]
+
+        # # 一维卷积
+        #
+        # x = x.permute(0, 2, 1, 3, 4, 5).flatten(start_dim=2)  # [4, 8, 4, 8, 8, 192]
+        # x = self.conv1d_on_camera_dim(x)
+        # x = x.view(bs, 1, 4, 8, 8, 192).squeeze(1).permute(0, 1, 4, 2, 3)  # ->[bs, num_his, dim, num_patch, num_patch]
+        #
+        # # lang_goal_embs
+        # x = x.permute(2, 0, 1, 3, 4).flatten(start_dim=2).transpose(0, 2)  # [dim, bs, num_his, num_patch, num_patch]->[dim, bs, num_his*num_patch*num_patch]-> [L, bs, dim]
+        # lang_goal_embs = self.linear1(lang_goal_embs)  # [bs, 77, 512]->[bs, 77, 192]
+        # x = self.lang_cross_atten(query=x, value=lang_goal_embs.transpose(0, 1))[-1]  # ->[seq_len, bs, dim]
+        # x = x.transpose(0, 1).view(bs, 4, 8, 8, 192).permute(0, 1, 4, 2, 3)  # [seq_len, bs, dim] -> [bs, nframe, dim, npatch, npatch]
+        #
+        # # global + local mamba
+        #
+        # h_l = torch.tensor(self.hilbert_curve_large_scale()["hilbert_curve_large_scale"]).to("cuda")  # [256]
+        # h_s = torch.tensor(self.hilbert_curve_small_scale()["hilbert_curve_small_scale"]).to("cuda")  # [64]
+        #
+        # M1 = self.GlobalMambaBlock1(x)  # ->[bs, nframe, dim, num_patch, num_patch]
+        # M1 = self.LocalMambaBlock1(M1, h_l)
+        # M1 = self.GlobalMambaBlock2(M1)
+        # M1 = self.LocalMambaBlock2(M1, h_l)  # ->[bs, nframe, dim, num_patch, num_patch]
+        #
+        # x_down = rearrange(M1, 'n d c h w ->  n c d h w')
+        # x_down = torch.nn.functional.relu(self.conv_down_sample (x_down))
+        # x_down = rearrange(x_down, 'n c d h w ->  n d c h w')  # ->[bs, nframe, dim*2, num_patch/2, num_patch/2]
+        #
+        # M2 = self.GlobalMambaBlockLowRes1(x_down)
+        # M2 = self.LocalMambaBlockLowRes1(M2, h_s)
+        # M2 = self.GlobalMambaBlockLowRes2(M2)
+        # M2 = self.LocalMambaBlockLowRes2(M2, h_s)
+        #
+        #
+        # x_re = rearrange(M2, 'n d c h w ->  n c d h w')
+        # x_re = self.conv_down_sample2(x_re).squeeze(2)
+        # x_re = rearrange(x_re, 'n c h w ->  n h w c')  # ->[bs, num_patch/2, num_patch/2, dim]
+        #
+        # hm = self.head(x_re)  # ->[bs,ncamera, H, W]
+        # return hm
+
+    def scale_point_cloud_features(self, pcd):
+        """
+        缩放并重新排列点云特征。
+
+        参数:
+        - pcd: 点云特征张量，形状为 (batch_size * num_cameras, channels, original_height, original_width)
+        - target_height: 缩放后的高度
+        - target_width: 缩放后的宽度
+        - num_cameras: 相机数量
+
+        返回:
+        - 缩放并重新排列后的点云特征张量，形状为 (batch_size, num_cameras * target_height * target_width, channels)
+        """
+
+        # 使用双线性插值缩放到目标宽高
+        pcd_scaled = torch.nn.functional.interpolate(pcd, size=(self.num_patch, self.num_patch), mode='bilinear')
+
+        # 重新排列点云特征
+        pcd_rearranged = rearrange(
+            pcd_scaled,
+            "(bt nframe) c h w -> bt nframe h w c",
+            nframe=self.num_camera * self.num_his_frames
+        )
+
+        return pcd_rearranged
+
+    def generate_mask(self, coord_list, attention_mask_size, neighborhood_size=1):
+        # coord像素坐标换算patch位置
+        # 计算该patch邻域位置
+        # 生成对应的attention mask,将对应patch的位置给与更高权重，patch顺序为按行展开
+        """
+        生成 attention mask，将目标 patch 及其邻域位置赋予更高权重。
+
+        参数:
+        - coord: tuple，目标像素坐标 (x, y)。
+        - attention_mask_size: int，attention mask 的尺寸 (假设为方形)。
+        - patch_size: int，每个 patch 的尺寸，默认为 16。
+        - neighborhood_size: int，邻域范围，默认为 1，表示包括目标 patch 和其一阶邻域。
+        - high_weight: int，目标 patch 和邻域的权重值，默认为 10。
+
+        返回:
+        - mask: Tensor，attention mask，大小为 [attention_mask_size, attention_mask_size]。
+        """
+        # 初始化 mask，所有位置权重默认为 1
+        batch_size = coord_list.shape[0]
+        mask = torch.zeros(batch_size, attention_mask_size[0], attention_mask_size[1])
+        high_weight = 1
+        switch2index = lambda x, y, cam_id: y * self.num_patch + x + cam_id * self.num_patch ** 2
+        #
+        # import pdb
+        # pdb.set_trace()
+        for bs in range(batch_size):
+            for idx, coord in enumerate(coord_list[bs]):
+                # 将像素坐标转化为 patch 坐标
+                patch_x, patch_y = int(coord[0] * self.img_height // self.patch_size), int(
+                    coord[1] * self.img_height // self.patch_size)
+
+                # 将 patch 坐标展开为线性索引
+
+                # 确定邻域 patch 的范围
+                for i in range(-neighborhood_size, neighborhood_size + 1):
+                    for j in range(-neighborhood_size, neighborhood_size + 1):
+                        # 计算邻域 patch 的坐标
+                        neighbor_x, neighbor_y = patch_x + i, patch_y + j
+
+                        # 确保邻域 patch 坐标在有效范围内
+                        if 0 <= neighbor_x < self.num_patch and 0 <= neighbor_y < self.num_patch:
+                            # 计算邻域 patch 的线性索引
+                            neighbor_index = switch2index(neighbor_x, neighbor_y, idx)
+
+                            # 将邻域 patch 的位置赋予高权重
+                            mask[bs, :, neighbor_index] = high_weight
+
+        return mask
 
     def hilbert_curve_large_scale(self, ):
         # B, nf, C, H, W = x.shape
 
-        nf = 4
-        H = 8
-        W = 8
+        nf = self.num_his_frames
+        H = self.num_patch
+        W = self.num_patch
 
         hilbert_curve = list(
             Hilbert3d(width=H, height=W, depth=nf))
@@ -254,7 +510,7 @@ class MyMambaPipeline(nn.Module):
         torch.save(hilbert_curve_small_scale, filename)
 
     @torch.no_grad()
-    def get_action_trans_single_pcd(self, target_point, cam_pcd, keyframe_pic, img_width, img_height, if_vis=False):
+    def get_action_trans_single_pcd(self, pre_point, target_point, cam_pcd, keyframe_pic, img_width, img_height, if_vis=False):
         """
         计算与target point欧式距离最近的campcd中的点是哪一个，并返回其图像坐标
         target_point (torch.Tensor): 世界坐标系下的点 [3]
@@ -275,24 +531,31 @@ class MyMambaPipeline(nn.Module):
         # 将线性索引转换为图像坐标 (x, y)
         y, x = divmod(min_dist_index.item(), img_width)  # 注意：这里的顺序为 (y, x)，因为 torch.argmin 返回的索引是按行展开的
 
-        if if_vis:
-            img = keyframe_pic.permute(1, 2, 0).numpy()  # 假设图像的形状为 [channel, height, width]
-            img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-5)
-            # 绘制图像和点
-            plt.figure(figsize=(8, 8))
-            plt.imshow(img)
-            plt.scatter(0, 128, color='blue', s=50, label='y max')
-            plt.scatter(128, 0, color='green', s=50, label='x max')
-            plt.scatter(0, 0, color='black', s=50, label='origin')
-            plt.scatter(x, y, color='red', s=50,
-                        label=f'Projected Point:{x},{y}')
+        img = keyframe_pic.permute(1, 2, 0).numpy()
+        img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-5)
+        img = (img * 255).astype(np.uint8)  # 转为 [0, 255] 范围
 
-            plt.title("Projected Point on Image")
-            plt.legend()
-            plt.show()
-            return torch.tensor([x, y])
-        else:
-            return torch.tensor([x, y])
+        # 绘制点
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # 转为 BGR
+        cv2.circle(img, (0, 128), 2, (255, 0, 0), -1)  # blue: y max
+        cv2.circle(img, (128, 0), 2, (0, 255, 0), -1)  # green: x max
+        cv2.circle(img, (0, 0), 2, (0, 0, 0), -1)  # black: origin
+        cv2.circle(img, (int(x), int(y)), 5, (0, 0, 255), -1)  # red: projected point
+        cv2.circle(img, (int(pre_point[0]), int(pre_point[1])), 5, (0, 255, 255), -1)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # 调整为 [C, H, W]
+        img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float()
+        # 归一化到 [0, 1]
+        img_tensor /= 255.0
+        
+
+        # 显示图片（如果需要）
+        if if_vis:
+            cv2.imshow("Projected Point on Image", img)
+            cv2.waitKey(2)
+            cv2.destroyAllWindows()
+
+        return torch.tensor([x, y]), img_tensor
 
     @torch.no_grad()
     def get_action_trans_single(self, target_point, cam_info_ex, cam_info_in, keyframe_pic, img_width, img_height):
@@ -916,7 +1179,7 @@ if __name__ == '__main__':
 
     inputs1 = torch.randn(1, 3, 16, 128, 128, device='cuda:0')
     inputs2 = torch.randn(1, 3, 16, 128, 128, device='cuda:0')
-    inputs3 = torch.randn(1, 7, 512, device='cuda:0')
+    inputs3 = torch.randn(1, 77, 512, device='cuda:0')
     model = my_mamba_model().cuda()
     inputs = [inputs1, inputs2, inputs3]
     flops = FlopCountAnalysis(model, inputs)

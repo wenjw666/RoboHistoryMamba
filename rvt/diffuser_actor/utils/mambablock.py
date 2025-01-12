@@ -204,3 +204,35 @@ class MambaLayerlocal(nn.Module):
         out = out.permute(0, 2, 1, 3, 4)
 
         return out
+
+
+class MambaTotalBlock(nn.Module):
+    def __init__(self, dim, total_layers_num):
+        super().__init__()
+        # 初始化模块列表
+        self.layers = nn.ModuleList()
+
+        assert total_layers_num % 2 == 0
+        # 计算需要的总层数
+
+        # 交替添加 MambaLayerlocal 和 MambaLayerglobal，直到达到总层数
+        for i in range(total_layers_num):
+            if i % 2 == 0:
+                # 添加 MambaLayerlocal
+                self.layers.append(MambaLayerglobal(dim))
+
+            elif i % 2 == 1:
+                # 添加 MambaLayerglobal
+                self.layers.append(MambaLayerlocal(dim))
+
+    def forward(self, x, hilbert_curve):
+        """
+        x: B, nf, C, H, W
+        """
+        # 依次通过所有层
+        for idx, layer in enumerate(self.layers):
+            if idx % 2 == 0:
+                x = layer(x)
+            elif idx % 2 == 1:
+                x = layer(x, hilbert_curve)
+        return x

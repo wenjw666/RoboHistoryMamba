@@ -65,7 +65,7 @@ def get_dataset(
         clip_model = None
 
     for task in tasks:  # for each task
-        # print("---- Preparing the data for {} task ----".format(task), flush=True)
+        print("---- Preparing the data for {} task ----".format(task), flush=True)
         EPISODES_FOLDER_TRAIN = f"train/{task}/all_variations/episodes"
         EPISODES_FOLDER_VAL = f"val/{task}/all_variations/episodes"
         data_path_train = os.path.join(DATA_FOLDER, EPISODES_FOLDER_TRAIN)
@@ -87,7 +87,7 @@ def get_dataset(
                 shutil.rmtree(test_replay_storage_folder)
                 print(f"remove {test_replay_storage_folder}")
 
-        # print("----- Train Buffer -----")
+        print("----- Train Buffer -----")
         fill_replay(
             replay=train_replay_buffer,
             task=task,
@@ -109,7 +109,7 @@ def get_dataset(
         )
 
         if not only_train:
-            # print("----- Test Buffer -----")
+            print("----- Test Buffer -----")
             fill_replay(
                 replay=test_replay_buffer,
                 task=task,

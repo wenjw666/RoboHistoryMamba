@@ -12,12 +12,15 @@ _C.exp_id = "def"
 _C.resume = ""
 # bs per device, effective bs is scaled by num device
 _C.bs = 4
+_C.bs_val = 4
 _C.epochs = 20
+_C.only_train = False
+_C.val_iter = 16 * 2
 # number of dataloader workers, >= 0
 _C.num_workers = 0
 # 'transition_uniform' or 'task_uniform'
 _C.sample_distribution_mode = 'transition_uniform'
-_C.train_iter = 16 * 10000
+_C.train_iter = 16 * 5
 
 # arguments present in both peract and rvt
 # some of them donot support every possible combination in peract

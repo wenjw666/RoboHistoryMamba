@@ -34,20 +34,24 @@ class RotaryPositionEncoding(nn.Module):
         return x
 
     def forward(self, x_position):
+        '''
+           @param x_position: [B,N]
+           @return:[B,N,2,2]
+           '''
         bsize, npoint = x_position.shape
         div_term = torch.exp(
             torch.arange(0, self.feature_dim, 2, dtype=torch.float, device=x_position.device)
             * (-math.log(10000.0) / (self.feature_dim)))
-        div_term = div_term.view(1, 1, -1) # [1, 1, d]
+        div_term = div_term.view(1, 1, -1)  # [1, 1, self.feature_dim/2]
 
-        sinx = torch.sin(x_position * div_term)  # [B, N, d]
+        sinx = torch.sin(x_position * div_term)  # [1, b,  n or self.feature_dim/2]
         cosx = torch.cos(x_position * div_term)
 
         sin_pos, cos_pos = map(
             lambda feat: torch.stack([feat, feat], dim=-1).view(bsize, npoint, -1),
             [sinx, cosx]
-        )
-        position_code = torch.stack([cos_pos, sin_pos] , dim=-1)
+        )# [B, N ,2] [B, N ,2]
+        position_code = torch.stack([cos_pos, sin_pos] , dim=-1)  # [B, N ,2 ,2]
 
         if position_code.requires_grad:
             position_code = position_code.detach()
@@ -64,13 +68,13 @@ class RotaryPositionEncoding3D(RotaryPositionEncoding):
     def forward(self, XYZ):
         '''
         @param XYZ: [B,N,3]
-        @return:
+        @return:[B,N,D,2]
         '''
         bsize, npoint, _ = XYZ.shape
         x_position, y_position, z_position = XYZ[..., 0:1], XYZ[..., 1:2], XYZ[..., 2:3]
         div_term = torch.exp(
             torch.arange(0, self.feature_dim // 3, 2, dtype=torch.float, device=XYZ.device)
-            * (-math.log(10000.0) / (self.feature_dim // 3))
+            * (-math.log(10000.0) / (self.feature_dim // 3))  # D/6
         )
         div_term = div_term.view(1, 1, -1)  # [1, 1, d//6]
 
@@ -84,12 +88,12 @@ class RotaryPositionEncoding3D(RotaryPositionEncoding):
         sinx, cosx, siny, cosy, sinz, cosz = map(
             lambda feat: torch.stack([feat, feat], -1).view(bsize, npoint, -1),
             [sinx, cosx, siny, cosy, sinz, cosz]
-        )
+        )  # [B, N, d//3]
 
         position_code = torch.stack([
             torch.cat([cosx, cosy, cosz], dim=-1),  # cos_pos
             torch.cat([sinx, siny, sinz], dim=-1)  # sin_pos
-        ], dim=-1)
+        ], dim=-1)  # [B, N, d,2]
 
         if position_code.requires_grad:
             position_code = position_code.detach()

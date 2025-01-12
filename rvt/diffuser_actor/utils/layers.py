@@ -284,7 +284,7 @@ class AdaLN(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
         self.modulation = nn.Sequential(
-             nn.SiLU(), nn.Linear(embedding_dim, 2 * embedding_dim, bias=True)
+            nn.SiLU(), nn.Linear(embedding_dim, 2 * embedding_dim, bias=True)
         )
         nn.init.constant_(self.modulation[-1].weight, 0)
         nn.init.constant_(self.modulation[-1].bias, 0)
@@ -341,7 +341,7 @@ class RelativeCrossAttentionLayer(nn.Module):
             self.adaln = AdaLN(embedding_dim)
 
     def forward(self, query, value, diff_ts=None,
-                query_pos=None, value_pos=None, pad_mask=None):
+                query_pos=None, value_pos=None, pad_mask=None, attn_mask=None):
         if diff_ts is not None:
             adaln_query = self.adaln(query, diff_ts)
         else:
@@ -351,7 +351,8 @@ class RelativeCrossAttentionLayer(nn.Module):
             key=value,
             value=value,
             rotary_pe=None if query_pos is None else (query_pos, value_pos),
-            key_padding_mask=pad_mask
+            key_padding_mask=pad_mask,
+            attn_mask=attn_mask
         )
         output = query + self.dropout(attn_output)
         output = self.norm(output)
@@ -404,11 +405,11 @@ class FFWRelativeCrossAttentionModule(nn.Module):
             ))
 
     def forward(self, query, value, diff_ts=None,
-                query_pos=None, value_pos=None):
+                query_pos=None, value_pos=None, attn_mask=None):
         output = []
         for i in range(self.num_layers):
             query = self.attn_layers[i](
-                query, value, diff_ts, query_pos, value_pos
+                query, value, diff_ts, query_pos, value_pos, attn_mask=attn_mask
             )
             query = self.ffw_layers[i](query, diff_ts)
             output.append(query)

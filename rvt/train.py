@@ -24,9 +24,12 @@ import config as exp_cfg_mod
 import rvt.models.rvt_agent as rvt_agent
 import rvt.utils.ddp_utils as ddp_utils
 import rvt.mvt.config as mvt_cfg_mod
+import rvt.mvt.config_mamba as mymamba_cfg_mod
 
 from rvt.mvt.mvt import MVT
-from rvt.models.rvt_agent import print_eval_log, print_loss_log
+from rvt.mvt.mambatest import MyMambaPipeline
+
+from rvt.models.my_agent import print_eval_log, print_loss_log, print_evaluation_log
 from rvt.utils.get_dataset import get_dataset
 from rvt.utils.rvt_utils import (
     TensorboardManager,
@@ -42,6 +45,49 @@ from rvt.utils.peract_utils import (
     DATA_FOLDER,
 )
 
+import rvt.models.my_agent as my_agent
+
+def val(agent, dataset, training_iterations, rank=0):
+    """
+    测试agent，返回测试效果
+    """
+    agent.train()  # 设置训练模式
+    log = defaultdict(list)
+
+    data_iter = iter(dataset)
+    iter_command = range(training_iterations)
+
+    for iteration in tqdm.tqdm(
+        iter_command, disable=(rank != 0), position=0, leave=True
+    ):
+
+        raw_batch = next(data_iter)
+       
+        batch = {
+            k: v.to(agent._device)
+            for k, v in raw_batch.items()
+            if type(v) == torch.Tensor
+        }  # 处理tensor类型数据
+        batch["tasks"] = raw_batch["tasks"]
+        batch["lang_goal"] = raw_batch["lang_goal"]
+        update_args = {
+            "step": iteration,
+        }
+        update_args.update(
+            {
+                "replay_sample": batch,
+                "backprop": False,
+                "reset_log": (iteration == 0),
+                "eval_log": True,
+            }
+        )
+        agent.update(**update_args)
+        torch.cuda.empty_cache()
+
+    if rank == 0:
+        log = print_evaluation_log(agent)
+
+    return log
 
 # new train takes the dataset as input
 def train(agent, dataset, training_iterations, rank=0):
@@ -90,12 +136,13 @@ def train(agent, dataset, training_iterations, rank=0):
                 "eval_log": False,
             }
         )
+        
         agent.update(**update_args)
         torch.cuda.empty_cache()
 
     if rank == 0:
         log = print_loss_log(agent)
-
+        
     return log
 
 
@@ -136,6 +183,9 @@ def get_logdir(cmd_args, exp_cfg):
 
 
 def dump_log(exp_cfg, mvt_cfg, cmd_args, log_dir):
+    """
+    保存当前训练参数文件
+    """
     with open(f"{log_dir}/exp_cfg.yaml", "w") as yaml_file:
         with redirect_stdout(yaml_file):
             print(exp_cfg.dump())
@@ -161,7 +211,7 @@ def experiment(rank, cmd_args, devices, port):
     ddp = len(devices) > 1  # 多卡
     ddp_utils.setup(rank, world_size=len(devices), port=port)  # 分配端口
 
-    exp_cfg = exp_cfg_mod.get_cfg_defaults()
+    exp_cfg = exp_cfg_mod.get_cfg_defaults()  # 主要加载训练参数
     if cmd_args.exp_cfg_path != "":
         exp_cfg.merge_from_file(cmd_args.exp_cfg_path)
     if cmd_args.exp_cfg_opts != "":
@@ -185,37 +235,72 @@ def experiment(rank, cmd_args, devices, port):
 
     # Things to change
     BATCH_SIZE_TRAIN = exp_cfg.bs
-    NUM_TRAIN = 100
+    BATCH_SIZE_VAL = exp_cfg.bs_val
+    NUM_TRAIN = 10
+    NUM_VAL = 10
     # to match peract, iterations per epoch
     TRAINING_ITERATIONS = int(exp_cfg.train_iter // (exp_cfg.bs * len(devices)))
     EPOCHS = exp_cfg.epochs
     TRAIN_REPLAY_STORAGE_DIR = "replay/replay_train"
-    TEST_REPLAY_STORAGE_DIR = "replay/replay_val"
+    TEST_REPLAY_STORAGE_DIR = "replay/replay_test"
+    VAL_REPLAY_STORAGE_DIR = "replay/replay_val"
+    VAL_ITERATIONS = int(exp_cfg.val_iter // (exp_cfg.bs * len(devices)))    
+    IF_ONLY_TRAIN = exp_cfg.only_train
     log_dir = get_logdir(cmd_args, exp_cfg)
     tasks = get_tasks(exp_cfg)
+
+
     print("Training on {} tasks: {}".format(len(tasks), tasks))
 
     t_start = time.time()
     get_dataset_func = lambda: get_dataset(
         tasks,
         BATCH_SIZE_TRAIN,
-        None,
+        BATCH_SIZE_VAL,
         TRAIN_REPLAY_STORAGE_DIR,
-        None,
+        VAL_REPLAY_STORAGE_DIR,
         DATA_FOLDER,
         NUM_TRAIN,
-        None,
+        NUM_VAL,
         cmd_args.refresh_replay,
         device,
         num_workers=exp_cfg.num_workers,
-        only_train=True,
+        only_train=IF_ONLY_TRAIN,
         sample_distribution_mode=exp_cfg.sample_distribution_mode,
     )
-    train_dataset, _ = get_dataset_func()
+    train_dataset, val_dataset = get_dataset_func()
     t_end = time.time()
+
+    print("=== train_dataset 关键属性 ===")
+    print(f"数据集对象: {train_dataset.dataset}")
+    # print(f"数据集总样本数: {len(train_dataset.dataset)}")
+    # print(f"总批次数: {len(train_dataset)}")
+    print(f"每批次大小 (batch_size): {train_dataset.batch_size}")
+    # print(f"是否随机打乱 (shuffle): {train_dataset.shuffle}")
+    print(f"是否丢弃最后不完整的批次 (drop_last): {train_dataset.drop_last}")
+    print(f"数据采样器 (sampler): {train_dataset.sampler}")
+    print(f"加载数据使用的子进程数 (num_workers): {train_dataset.num_workers}")
+    print(f"是否使用固定内存加速 (pin_memory): {train_dataset.pin_memory}")
+    print(f"预取因子 (prefetch_factor): {getattr(train_dataset, 'prefetch_factor', 'N/A')}")
+    print(f"子进程初始化函数 (worker_init_fn): {train_dataset.worker_init_fn}")
+    if not IF_ONLY_TRAIN:
+        print("=== val_dataset 关键属性 ===")
+        print(f"数据集对象: {val_dataset.dataset}")
+        # print(f"数据集总样本数: {len(val_dataset.dataset)}")
+        # print(f"总批次数: {len(val_dataset)}")
+        print(f"每批次大小 (batch_size): {val_dataset.batch_size}")
+        # print(f"是否随机打乱 (shuffle): {val_dataset.shuffle}")
+        print(f"是否丢弃最后不完整的批次 (drop_last): {val_dataset.drop_last}")
+        print(f"数据采样器 (sampler): {val_dataset.sampler}")
+        print(f"加载数据使用的子进程数 (num_workers): {val_dataset.num_workers}")
+        print(f"是否使用固定内存加速 (pin_memory): {val_dataset.pin_memory}")
+        print(f"预取因子 (prefetch_factor): {getattr(val_dataset, 'prefetch_factor', 'N/A')}")
+        print(f"子进程初始化函数 (worker_init_fn): {val_dataset.worker_init_fn}")
     print("Created Dataset. Time Cost: {} minutes".format((t_end - t_start) / 60.0))
 
+    # 读取参数
     if exp_cfg.agent == "our":
+        # 加载自定义模型的模型参数
         mvt_cfg = mvt_cfg_mod.get_cfg_defaults()
         if cmd_args.mvt_cfg_path != "":
             mvt_cfg.merge_from_file(cmd_args.mvt_cfg_path)
@@ -230,18 +315,40 @@ def experiment(rank, cmd_args, devices, port):
             mvt_cfg.num_rot, exp_cfg.peract.num_rotation_classes
         )
 
+        mymamba_cfg = mymamba_cfg_mod.get_cfg_defaults()
+        mymamba_cfg.freeze()
+
+
         torch.cuda.set_device(device)
         torch.cuda.empty_cache()
         # 实例化模型
-        rvt = MVT(
-            renderer_device=device,
-            **mvt_cfg,
-        ).to(device)
-        if ddp:
-            rvt = DDP(rvt, device_ids=[device])
+        # rvt = MVT(
+        #     renderer_device=device,
+        #     **mvt_cfg,
+        # ).to(device)
 
-        agent = rvt_agent.RVTAgent(
-            network=rvt,
+        mamba_pipeline = MyMambaPipeline(**mymamba_cfg.mymamba).to(device)
+
+        # if ddp:
+        #     rvt = DDP(rvt, device_ids=[device])
+
+        # 加载agent
+
+        # agent = rvt_agent.RVTAgent(
+        #     network=rvt,
+        #     image_resolution=[IMAGE_SIZE, IMAGE_SIZE],
+        #     add_lang=mvt_cfg.add_lang,
+        #     stage_two=mvt_cfg.stage_two,
+        #     rot_ver=mvt_cfg.rot_ver,
+        #     scene_bounds=SCENE_BOUNDS,
+        #     cameras=CAMERAS,
+        #     log_dir=f"{log_dir}/test_run/",
+        #     cos_dec_max_step=EPOCHS * TRAINING_ITERATIONS,
+        #     **exp_cfg.peract,
+        #     **exp_cfg.rvt,
+        # )
+        agent = my_agent.MyAgent(
+            network=mamba_pipeline,
             image_resolution=[IMAGE_SIZE, IMAGE_SIZE],
             add_lang=mvt_cfg.add_lang,
             stage_two=mvt_cfg.stage_two,
@@ -253,6 +360,7 @@ def experiment(rank, cmd_args, devices, port):
             **exp_cfg.peract,
             **exp_cfg.rvt,
         )
+        # 初始化优化器设置
         agent.build(training=True, device=device)
     else:
         assert False, "Incorrect agent"
@@ -279,7 +387,9 @@ def experiment(rank, cmd_args, devices, port):
         exp_cfg.freeze()
         tb = TensorboardManager(log_dir)
 
-    print("Start training ...", flush=True)
+    import pdb
+    pdb.set_trace()
+    print("Start training ...")
     i = start_epoch
     while True:
         if i == end_epoch:
@@ -289,14 +399,21 @@ def experiment(rank, cmd_args, devices, port):
 
         out = train(agent, train_dataset, TRAINING_ITERATIONS, rank)
 
-        if rank == 0:
-            tb.update("train", i, out)
+        # if rank == 0:
+        tb.update("train", i, out)
 
-        if rank == 0:
+        if not IF_ONLY_TRAIN:
+            print("----- val -----")
+            out = val(agent, val_dataset, VAL_ITERATIONS, rank)
+
+            tb.update("val", i, out)  
+        
+        # if rank == 0:
             # TODO: add logic to only save some models
-            save_agent(agent, f"{log_dir}/model_{i}.pth", i)
-            save_agent(agent, f"{log_dir}/model_last.pth", i)
+        # save_agent(agent, f"{log_dir}/model_{i}.pth", i)
+        # save_agent(agent, f"{log_dir}/model_last.pth", i)
         i += 1
+
 
     if rank == 0:
         tb.close()

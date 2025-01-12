@@ -547,6 +547,7 @@ class RVTAgent:
             1,
             self._net_mod.proprio_dim,
         )
+        torch.autograd.set_detect_anomaly(True)
 
         # sample
         action_rot_grip = replay_sample["rot_grip_action_indicies"][
@@ -864,8 +865,14 @@ class RVTAgent:
             # vis_img_feat = vis_img_feat.permute(0, 4, 1, 2, 3).repeat(1, 1, 4, 1, 1).cuda()  # [4, 3, 4, 128, 128]
             # vis_pc_feat = vis_pc_feat.permute(0, 4, 1, 2, 3).repeat(1, 1, 4, 1, 1).cuda()  # [4, 3, 4, 128, 128]
 
-            hm_result = self.mamba_pipeline([history_img_feats, history_pc, lang_goal_embs])
-            hm_result = hm_result.view(bs, 4, -1).transpose(1, 2).clone()
+            pre_bbox, pre_points = self.mamba_pipeline([history_img_feats, history_pc, lang_goal_embs])
+
+            # pre_points_result = mvt_utils.generate_hm_from_pt(
+            #     pre_points.reshape(-1, 2),  # torch.Size([20, 2])
+            #     (128, 128),
+            #     sigma=self.gt_hm_sigma,  # 1.5
+            #     thres_sigma_times=3,
+            # ).view(bs, 4, 128, 128).flatten(start_dim=2,end_dim=3).transpose(1,2)  # ([bs*ncam, H, W])
 
             # cam_info = [torch.concat([replay_sample["front_camera_keyframe_extrinsics"],
             #                           replay_sample["left_shoulder_camera_keyframe_extrinsics"],
@@ -912,8 +919,19 @@ class RVTAgent:
         if backprop:
             with autocast(enabled=self.amp):
                 # cross-entropy loss
-                trans_loss = self._cross_entropy_loss(hm_result, action_trans).mean()
-                print(f"loss:{trans_loss}")
+                # trans_loss = self._cross_entropy_loss(pre_points_result, action_trans).mean()
+
+                trans_loss_point_1 = nn.functional.smooth_l1_loss(pre_points[-1].reshape(-1, 2),
+                                                                  target_point.reshape(-1, 2).to("cuda:0"))
+                trans_loss_point_2 = nn.functional.smooth_l1_loss(pre_points[-2].reshape(-1, 2),
+                                                                  target_point.reshape(-1, 2).to("cuda:0"))
+                trans_loss_point_3 = nn.functional.smooth_l1_loss(pre_bbox[-1],
+                                                                  torch.stack(wpt, dim=0).to("cuda:0"))
+                trans_loss_point_4 = nn.functional.smooth_l1_loss(pre_bbox[-2],
+                                                                  torch.stack(wpt, dim=0).to("cuda:0"))
+                trans_loss = trans_loss_point_1 + trans_loss_point_2 + 100*trans_loss_point_3 + 100*trans_loss_point_4
+                print(
+                    f"loss:{trans_loss},loss1:{trans_loss_point_1},loss2:{trans_loss_point_2},loss3:{trans_loss_point_3},loss4:{trans_loss_point_4}")
                 # trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()
                 rot_loss_x = rot_loss_y = rot_loss_z = 0.0
                 grip_loss = 0.0

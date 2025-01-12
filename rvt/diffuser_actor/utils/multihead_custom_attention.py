@@ -396,8 +396,13 @@ def multi_head_attention_forward(query,  # type: Tensor
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
     if attn_mask is not None:
-        attn_mask = attn_mask.unsqueeze(0)
-        attn_output_weights += attn_mask
+        # import pdb
+        # pdb.set_trace()
+        if len(attn_mask.shape) == 2:
+            attn_mask = attn_mask.unsqueeze(0)
+        elif len(attn_mask.shape) == 3:
+            attn_mask = torch.stack([attn_mask for _ in range(num_heads)],dim=1).view(bsz * num_heads, tgt_len, src_len)
+        attn_output_weights += attn_mask.to(attn_output_weights.device)
 
     if key_padding_mask is not None:
         attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)

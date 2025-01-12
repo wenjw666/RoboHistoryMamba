@@ -8,10 +8,10 @@ rvt/data/val/
 rvt/data/test/
 rvt/replay/
 rvt/libs/
-rvt/mamba/
-rvt/causal-conv1d/
+# rvt/mamba/
+# rvt/causal-conv1d/
 coppelia_install_dir/
-rvt/runs/
+# rvt/runs/
 runs_ngc_mnt
 runs_temp
 *.ipynb_checkpoints/

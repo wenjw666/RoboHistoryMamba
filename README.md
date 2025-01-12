@@ -238,3 +238,263 @@ License Copyright © 2023, NVIDIA Corporation & affiliates. All rights reserved.
 
 This work is made available under the [Nvidia Source Code License](https://github.com/NVlabs/RVT/blob/master/LICENSE).
 The pretrained RVT models are released under the CC-BY-NC-SA-4.0 license.
+
+## Implementation Details
+
+### Model Architecture
+
+RVT/RVT-2的主要实现逻辑包含以下几个部分:
+
+1. 主要Agent实现在 `rvt/models/my_agent.py` 中:
+- 使用MVT(Multi-View Transformer)处理多视角输入
+- 支持历史帧信息处理(默认4帧)
+- 实现了图像增强和点云处理
+- 支持LAMB和Adam优化器
+- 支持余弦学习率衰减调度
+
+2. 核心模块:
+- Encoder: 处理视觉、语言和位置编码
+- Attention机制: 支持标准attention和flash attention
+- 点云渲染器: 支持自定义点云渲染和PyTorch3D渲染
+
+### Project Structure
+
+```
+RVT/
+├── rvt/                    # 主要代码目录
+│   ├── models/            # 模型实现
+│   ├── mvt/              # Multi-View Transformer实现
+│   ├── diffuser_actor/   # Diffusion模型相关代码
+│   └── utils/            # 工具函数
+├── configs/               # 配置文件
+└── data/                 # 数据目录(需要手动添加)
+```
+
+### Git Configuration
+
+1. Large files (使用Git LFS管理):
+```
+*.ttt  # RLBench任务文件
+*.ttm  # RLBench模型文件
+```
+
+2. Ignored files/directories:
+```
+# Python
+*__pycache__/
+*.egg-info/
+
+# Data & Models
+rvt/data/train/
+rvt/data/val/ 
+rvt/data/test/
+rvt/replay/
+rvt/runs/
+runs_ngc_mnt/
+runs_temp/
+
+# IDE
+.vscode/
+.idea/
+```
+
+3. Submodules (需要手动初始化):
+```
+rvt/libs/PyRep         # 机器人仿真环境
+rvt/libs/RLBench      # 任务环境
+rvt/libs/YARR         # 强化学习框架
+rvt/libs/peract       # PerAct基准实现
+rvt/libs/peract_colab # PerAct演示代码
+```
+
+4. 库文件:
+```
+# 第三方库
+rvt/libs/           # 子模块库会被单独管理,不在此忽略
+```
+
+注意事项:
+1. 数据集和预训练模型需要手动下载并放置到对应目录
+2. 训练日志和模型检查点会自动生成在runs目录
+3. 第三方库通过git submodule管理,不在.gitignore中忽略
+4. 临时文件和IDE配置文件统一忽略
+
+### Git Configuration Details
+
+#### .gitignore 说明
+项目中被忽略的文件和目录:
+
+1. Python相关:
+```
+# Python缓存文件
+*__pycache__/
+*.py[cod]
+*$py.class
+
+# Python包构建
+*.egg-info/
+dist/
+build/
+```
+
+2. 数据和模型:
+```
+# 数据集目录
+rvt/data/train/
+rvt/data/val/
+rvt/data/test/
+
+# 预训练模型和训练记录
+rvt/replay/          # 预生成的replay buffer
+rvt/runs/            # 训练日志和模型检查点
+runs_ngc_mnt/        # NGC训练相关
+runs_temp/           # 临时训练记录
+
+# Mamba相关
+rvt/mamba/
+rvt/causal-conv1d/
+```
+
+3. 环境和IDE:
+```
+# CoppeliaSim安装目录
+coppelia_install_dir/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 虚拟环境
+venv/
+env/
+```
+
+4. 库文件:
+```
+# 第三方库
+rvt/libs/           # 子模块库会被单独管理,不在此忽略
+```
+
+注意事项:
+1. 数据集和预训练模型需要手动下载并放置到对应目录
+2. 训练日志和模型检查点会自动生成在runs目录
+3. 第三方库通过git submodule管理,不在.gitignore中忽略
+4. 临时文件和IDE配置文件统一忽略
+
+### Manual Setup Steps
+
+1. 数据准备:
+- 在 `rvt/data/` 下创建 train/val/test 目录
+- 下载并解压数据集到对应目录
+
+2. 初始化子模块:
+```bash
+git submodule update --init --recursive
+```
+
+3. 安装依赖:
+- PyTorch3D (可选,仅RVT需要)
+- xformers (可选,用于加速attention)
+
+4. 下载预训练模型:
+- RVT-2模型放置在 `RVT/rvt/runs/rvt2/`
+- RVT模型放置在 `RVT/rvt/runs/rvt/`
+
+### Data and Training Logs
+
+#### Dataset Structure
+数据集需要按以下结构存放:
+```
+RVT/rvt/data/
+├── train/                 # 训练集
+│   ├── close_jar/        # 任务1
+│   │   ├── 0/           # demo 0
+│   │   │   ├── front_rgb/
+│   │   │   ├── front_point_cloud/
+│   │   │   ├── wrist_rgb/
+│   │   │   └── ...
+│   │   └── ...          # 更多demos
+│   └── ...              # 更多任务
+├── val/                  # 验证集(结构同train)
+└── test/                # 测试集(结构同train)
+```
+
+#### Training Logs
+训练记录存放在以下路径:
+```
+RVT/rvt/runs/
+├── rvt2/                # RVT-2模型训练记录
+│   ├── events.out.tfevents.*  # Tensorboard日志
+│   ├── model_*.pth            # 模型检查点
+│   └── config.yaml            # 训练配置
+└── rvt/                 # RVT模型训练记录
+    ├── events.out.tfevents.*
+    ├── model_*.pth  
+    └── config.yaml
+```
+
+#### 使用Tensorboard查看训练过程
+1. 启动Tensorboard:
+```bash
+cd RVT/rvt
+tensorboard --logdir runs/
+```
+
+2. 在浏览器中打开 http://localhost:6006 查看:
+- Scalars: 损失曲线、准确率等指标
+- Images: 预测结果可视化
+- Graphs: 模型结构图
+- Distributions: 网络参数分布
+
+主要指标说明:
+- total_loss: 总损失
+- trans_loss: 平移预测损失
+- rot_loss: 旋转预测损失 
+- grip_loss: 夹爪状态预测损失
+- lr: 学习率变化曲线
+
+训练过程中会定期保存模型检查点到runs目录。每个检查点包含:
+- 模型权重
+- 优化器状态
+- 训练配置
+- 当前epoch/step信息
+
+### Storage Requirements
+
+根据目录大小统计，使用者需要注意以下空间占用：
+
+```
+RVT/rvt/                # 总计约13GB
+├── replay/            # ~8.9GB - 预生成的replay buffer
+├── data/             # ~2.8GB - 数据集目录
+├── libs/             # ~806MB - 第三方库
+├── mamba/            # ~528MB - Mamba相关代码
+├── causal-conv1d/    # ~88MB  - 因果卷积相关
+└── runs/             # ~38MB  - 训练记录
+```
+
+注意事项：
+1. 完整数据集下载后，data目录会显著增长:
+   - 训练集：~50-100GB
+   - 验证集：~10-20GB
+   - 测试集：~10-20GB
+
+2. 训练过程中，runs目录会逐渐增长:
+   - 每个模型检查点：~1-2GB
+   - 完整训练记录：~2-5GB/个模型
+
+3. Replay buffer说明:
+   - 预生成的完整replay buffer：~98GB
+   - 当前仅包含部分数据：~8.9GB
+   - 可按需下载或在训练时生成
+
+4. 总存储需求：
+   - 最小安装（仅代码）：~1.5GB
+   - 基础训练（含部分数据）：~15GB
+   - 完整安装（所有数据）：~150-200GB
+
+建议预留足够的磁盘空间，特别是打算进行完整训练时。
+
+
